@@ -458,6 +458,7 @@ struct vfio_iommu_type1_dma_unmap {
 #include <fcntl.h>
 #include <libgen.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -479,6 +480,7 @@ void usage(char *name)
     printf("    e - just exit (return from main)\n");
     printf("    c - close device FDs before exit\n");
     printf("    t - concurrently close device FDs before exit\n");
+    printf("    p - open and close in indivual process context\n");
 }
 
 void *thread_close_device(void *device)
@@ -497,7 +499,7 @@ int main(int argc, char **argv)
     char path[PATH_MAX], iommu_group_path[PATH_MAX], *group_name;
     struct stat st;
     ssize_t len;
-    enum mode { mode_exit, mode_close, mode_thread_close } mode;
+    enum mode { mode_exit, mode_close, mode_thread_close, mode_process_close } mode;
     struct timespec ts[MAX_DEVS];
     int seg[MAX_DEVS], bus[MAX_DEVS], slot[MAX_DEVS], func[MAX_DEVS];
 
@@ -518,6 +520,9 @@ int main(int argc, char **argv)
             break;
         case 't':
             mode = mode_thread_close;
+            break;
+        case 'p':
+            mode = mode_process_close;
             break;
         default:
             printf("Bad mode '%c'\n", argv[1][0]);
@@ -617,66 +622,158 @@ int main(int argc, char **argv)
     }
     printf("Done: set IOMMU\n");
 
-    for (i=2;i<argc; i++) {
-        snprintf(path, sizeof(path), "%04x:%02x:%02x.%d",
-                 seg[i], bus[i], slot[i], func[i]);
-        printf("opening PCI device %s on group %d\n", path, group[i]);
+    if ( mode == mode_process_close) {
+        sem_t *sem_ready[MAX_DEVS];
+        sem_t *sem_go[MAX_DEVS];
 
-        device[i] = ioctl(group[i], VFIO_GROUP_GET_DEVICE_FD, path);
-        if (device[i] < 0) {
-            printf("Failed to get device %s\n", path);
-            return -1;
+        for (i=2;i<argc; i++) {
+            snprintf(path, sizeof(path), "%04x:%02x:%02x.%d-ready",
+                     seg[i], bus[i], slot[i], func[i]);
+            sem_ready[i] = sem_open(path, O_CREAT | O_EXCL, 0644, 0);
+            if (sem_ready[i] == SEM_FAILED) {
+                fprintf(stderr, "sem_open() failed.  errno:%d\n", errno);
+                exit(1);
+            }
+            sem_unlink(path);
+            snprintf(path, sizeof(path), "%04x:%02x:%02x.%d-go",
+                     seg[i], bus[i], slot[i], func[i]);
+            sem_go[i] = sem_open(path, O_CREAT | O_EXCL, 0644, 0);
+            if (sem_go[i] == SEM_FAILED) {
+                fprintf(stderr, "sem_open() failed.  errno:%d\n", errno);
+                exit(1);
+            }
+            sem_unlink(path);
         }
 
-        if (ioctl(device[i], VFIO_DEVICE_GET_INFO, &device_info)) {
-            printf("Failed to get device info\n");
-            return -1;
+        /* open and close paths for devices are different for mode_process_close */
+        for (i=2;i<argc; i++) {
+            if (fork() == 0) {
+                // Child
+                snprintf(path, sizeof(path), "%04x:%02x:%02x.%d",
+                         seg[i], bus[i], slot[i], func[i]);
+                printf("%d: opening PCI device %s on group %d\n", i, path, group[i]);
+
+                device[i] = ioctl(group[i], VFIO_GROUP_GET_DEVICE_FD, path);
+                if (device[i] < 0) {
+                    printf("Failed to get device %s\n", path);
+                    return -1;
+                }
+
+                if (ioctl(device[i], VFIO_DEVICE_GET_INFO, &device_info)) {
+                    printf("Failed to get device info\n");
+                    return -1;
+                }
+
+                sem_post(sem_ready[i]);
+                sem_wait(sem_go[i]);
+                // exit would release the vfio FD anyway, but be explicit to be sure on the timing
+                clock_gettime(CLOCK_MONOTONIC, &ts[i]);
+                printf("%d: start close - %ld.%09ld\n", i, ts[i].tv_sec, ts[i].tv_nsec);
+                close(device[i]);
+                clock_gettime(CLOCK_MONOTONIC, &ts[i]);
+                printf("%d: close done - %ld.%09ld\n", i, ts[i].tv_sec, ts[i].tv_nsec);
+                sem_post(sem_ready[i]);
+                sem_wait(sem_go[i]);
+                printf("Exit child %d\n", i);
+                sem_close(sem_ready[i]);
+                sem_close(sem_go[i]);
+                exit(0);
+            }
         }
+        // Parent after all childs are forked
+        for (i=2;i<argc; i++) {
+            sem_wait(sem_ready[i]);
+        }
+        printf("All devices attached to childs - Press any key to exit\n");
+        fgetc(stdin);
 
-        printf("Device (%d) supports %d regions, %d irqs\n",
-               device[i], device_info.num_regions, device_info.num_irqs);
-    }
-
-    printf("All devices attached - Press any key to exit\n");
-    fgetc(stdin);
-
-    clock_gettime(CLOCK_MONOTONIC, &ts[0]);
-    printf("Start exit path - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
-
-    if ( mode == mode_close) {
-        printf("Closing devices in a sequential loop\n");
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
         for (i=2;i<argc; i++) {
             clock_gettime(CLOCK_MONOTONIC, &ts[i]);
-            printf("Close device '%d' - %ld.%09ld\n", device[i], ts[i].tv_sec, ts[i].tv_nsec);
-            close(device[i]);
+            printf("release %d - %ld.%09ld\n", i, ts[i].tv_sec, ts[i].tv_nsec);
+            sem_post(sem_go[i]);
+        }
+        printf("Started concurrent exit in childs at - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+        for (i=2;i<argc; i++) {
+            sem_wait(sem_ready[i]);
         }
         clock_gettime(CLOCK_MONOTONIC, &ts[0]);
-        printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
-        printf("Press any key to exit\n");
-        fgetc(stdin);
-    }
+        printf("All childs dropped vfio device - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
 
-    if ( mode == mode_thread_close) {
-        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
-        printf("Closing devices concurrently - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
-        for (i=2;i<argc; i++) {
-            if(pthread_create(&thread[i], NULL, thread_close_device, &device[i])) {
-                printf("Error creating thread\n");
-                return -1;
-            }
-        }
-        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
-        printf("Spawned all closing threads - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
-        for (i=2;i<argc; i++) {
-            if(pthread_join(thread[i], NULL)) {
-                printf("Error joining thread\n");
-                return -1;
-            }
-        }
-        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
-        printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
         printf("Press any key to exit\n");
         fgetc(stdin);
+        for (i=2;i<argc; i++) {
+            sem_post(sem_go[i]);
+        }
+        for (i=2;i<argc; i++) {
+            sem_close(sem_ready[i]);
+            sem_close(sem_go[i]);
+        }
+        printf("Exit parent\n");
+        exit(0);
+    }
+    else {
+        for (i=2;i<argc; i++) {
+            snprintf(path, sizeof(path), "%04x:%02x:%02x.%d",
+                     seg[i], bus[i], slot[i], func[i]);
+            printf("opening PCI device %s on group %d\n", path, group[i]);
+
+            device[i] = ioctl(group[i], VFIO_GROUP_GET_DEVICE_FD, path);
+            if (device[i] < 0) {
+                printf("Failed to get device %s\n", path);
+                return -1;
+            }
+
+            if (ioctl(device[i], VFIO_DEVICE_GET_INFO, &device_info)) {
+                printf("Failed to get device info\n");
+                return -1;
+            }
+
+            printf("Device (%d) supports %d regions, %d irqs\n",
+                   device[i], device_info.num_regions, device_info.num_irqs);
+        }
+
+        printf("All devices attached - Press any key to exit\n");
+        fgetc(stdin);
+
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+        printf("Start exit path - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+
+        if ( mode == mode_close) {
+            printf("Closing devices in a sequential loop\n");
+            for (i=2;i<argc; i++) {
+                clock_gettime(CLOCK_MONOTONIC, &ts[i]);
+                printf("Close device '%d' - %ld.%09ld\n", device[i], ts[i].tv_sec, ts[i].tv_nsec);
+                close(device[i]);
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+            printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+            printf("Press any key to exit\n");
+            fgetc(stdin);
+        }
+
+        if ( mode == mode_thread_close) {
+            clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+            printf("Closing devices concurrently - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+            for (i=2;i<argc; i++) {
+                if(pthread_create(&thread[i], NULL, thread_close_device, &device[i])) {
+                    printf("Error creating thread\n");
+                    return -1;
+                }
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+            printf("Spawned all closing threads - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+            for (i=2;i<argc; i++) {
+                if(pthread_join(thread[i], NULL)) {
+                    printf("Error joining thread\n");
+                    return -1;
+                }
+            }
+            clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+            printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+            printf("Press any key to exit\n");
+            fgetc(stdin);
+        }
     }
 
     return 0;

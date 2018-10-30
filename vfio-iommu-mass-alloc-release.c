@@ -457,6 +457,7 @@ struct vfio_iommu_type1_dma_unmap {
 #include <libgen.h>
 #include <fcntl.h>
 #include <libgen.h>
+#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -477,6 +478,14 @@ void usage(char *name)
     printf("  mode controlls what is done after a key is pressed:\n");
     printf("    e - just exit (return from main)\n");
     printf("    c - close device FDs before exit\n");
+    printf("    t - concurrently close device FDs before exit\n");
+}
+
+void *thread_close_device(void *device)
+{
+    int *devicefd = (int *)device;
+    close(*devicefd);
+    return NULL;
 }
 
 #define MAX_DEVS 64
@@ -484,11 +493,12 @@ void usage(char *name)
 int main(int argc, char **argv)
 {
     int i, ret, container, group[MAX_DEVS], device[MAX_DEVS], groupid;
+    pthread_t thread[MAX_DEVS];
     char path[PATH_MAX], iommu_group_path[PATH_MAX], *group_name;
     struct stat st;
     ssize_t len;
-    enum mode { mode_exit, mode_close } mode;
-    struct timespec ts;
+    enum mode { mode_exit, mode_close, mode_thread_close } mode;
+    struct timespec ts[MAX_DEVS];
     int seg[MAX_DEVS], bus[MAX_DEVS], slot[MAX_DEVS], func[MAX_DEVS];
 
     struct vfio_group_status group_status = {
@@ -505,6 +515,9 @@ int main(int argc, char **argv)
             break;
         case 'c':
             mode = mode_close;
+            break;
+        case 't':
+            mode = mode_thread_close;
             break;
         default:
             printf("Bad mode '%c'\n", argv[1][0]);
@@ -627,18 +640,43 @@ int main(int argc, char **argv)
     printf("All devices attached - Press any key to exit\n");
     fgetc(stdin);
 
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    printf("Start exit path - %ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
+    clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+    printf("Start exit path - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
 
     if ( mode == mode_close) {
-        printf("Closing devices in a loop\n");
+        printf("Closing devices in a sequential loop\n");
         for (i=2;i<argc; i++) {
-            clock_gettime(CLOCK_MONOTONIC, &ts);
-            printf("Close device '%d' - %ld.%09ld\n", device[i], ts.tv_sec, ts.tv_nsec);
+            clock_gettime(CLOCK_MONOTONIC, &ts[i]);
+            printf("Close device '%d' - %ld.%09ld\n", device[i], ts[i].tv_sec, ts[i].tv_nsec);
             close(device[i]);
         }
-        clock_gettime(CLOCK_MONOTONIC, &ts);
-        printf("Droped all devices - %ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+        printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+        printf("Press any key to exit\n");
+        fgetc(stdin);
+    }
+
+    if ( mode == mode_thread_close) {
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+        printf("Closing devices concurrently - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+        for (i=2;i<argc; i++) {
+            if(pthread_create(&thread[i], NULL, thread_close_device, &device[i])) {
+                printf("Error creating thread\n");
+                return -1;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+        printf("Spawned all closing threads - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+        for (i=2;i<argc; i++) {
+            if(pthread_join(thread[i], NULL)) {
+                printf("Error joining thread\n");
+                return -1;
+            }
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts[0]);
+        printf("Droped all devices - %ld.%09ld\n", ts[0].tv_sec, ts[0].tv_nsec);
+        printf("Press any key to exit\n");
+        fgetc(stdin);
     }
 
     return 0;

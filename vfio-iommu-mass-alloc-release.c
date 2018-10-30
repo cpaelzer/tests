@@ -460,6 +460,7 @@ struct vfio_iommu_type1_dma_unmap {
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -472,17 +473,22 @@ struct vfio_iommu_type1_dma_unmap {
 
 void usage(char *name)
 {
-    printf("usage: %s <ssss:bb:dd.f> ...\n", name);
+    printf("usage: %s <mode> <ssss:bb:dd.f> [...]\n", name);
+    printf("  mode controlls what is done after a key is pressed:\n");
+    printf("    e - just exit (return from main)\n");
+    printf("    c - close device FDs before exit\n");
 }
 
 #define MAX_DEVS 64
 
 int main(int argc, char **argv)
 {
-    int i, ret, container, group[MAX_DEVS], device, groupid;
+    int i, ret, container, group[MAX_DEVS], device[MAX_DEVS], groupid;
     char path[PATH_MAX], iommu_group_path[PATH_MAX], *group_name;
     struct stat st;
     ssize_t len;
+    enum mode { mode_exit, mode_close } mode;
+    struct timespec ts;
     int seg[MAX_DEVS], bus[MAX_DEVS], slot[MAX_DEVS], func[MAX_DEVS];
 
     struct vfio_group_status group_status = {
@@ -493,11 +499,25 @@ int main(int argc, char **argv)
         .argsz = sizeof(device_info)
     };
 
+    switch (argv[1][0])  {
+        case 'e':
+            mode = mode_exit;
+            break;
+        case 'c':
+            mode = mode_close;
+            break;
+        default:
+            printf("Bad mode '%c'\n", argv[1][0]);
+            usage(argv[0]);
+            return -1;
+            break;
+    }
+
     struct vfio_region_info region_info = {
         .argsz = sizeof(region_info)
     };
 
-    for (i=1;i<argc; i++) {
+    for (i=2;i<argc; i++) {
         ret = sscanf(argv[i], "%04x:%02x:%02x.%d", &seg[i], &bus[i], &slot[i], &func[i]);
         if (ret != 4) {
             ret = sscanf(argv[i], "%02x", &bus[i]);
@@ -518,7 +538,7 @@ int main(int argc, char **argv)
     }
     printf("Container '%d' opened\n", container);
 
-    for (i=1;i<argc; i++) {
+    for (i=2;i<argc; i++) {
         snprintf(path, sizeof(path),
              "/sys/bus/pci/devices/%04x:%02x:%02x.%01x/",
              seg[i], bus[i], slot[i], func[i]);
@@ -584,28 +604,42 @@ int main(int argc, char **argv)
     }
     printf("Done: set IOMMU\n");
 
-    for (i=1;i<argc; i++) {
+    for (i=2;i<argc; i++) {
         snprintf(path, sizeof(path), "%04x:%02x:%02x.%d",
                  seg[i], bus[i], slot[i], func[i]);
         printf("opening PCI device %s on group %d\n", path, group[i]);
 
-        device = ioctl(group[i], VFIO_GROUP_GET_DEVICE_FD, path);
-        if (device < 0) {
+        device[i] = ioctl(group[i], VFIO_GROUP_GET_DEVICE_FD, path);
+        if (device[i] < 0) {
             printf("Failed to get device %s\n", path);
             return -1;
         }
 
-        if (ioctl(device, VFIO_DEVICE_GET_INFO, &device_info)) {
+        if (ioctl(device[i], VFIO_DEVICE_GET_INFO, &device_info)) {
             printf("Failed to get device info\n");
             return -1;
         }
 
         printf("Device (%d) supports %d regions, %d irqs\n",
-               device, device_info.num_regions, device_info.num_irqs);
+               device[i], device_info.num_regions, device_info.num_irqs);
     }
 
     printf("All devices attached - Press any key to exit\n");
     fgetc(stdin);
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    printf("Start exit path - %ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
+
+    if ( mode == mode_close) {
+        printf("Closing devices in a loop\n");
+        for (i=2;i<argc; i++) {
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            printf("Close device '%d' - %ld.%09ld\n", device[i], ts.tv_sec, ts.tv_nsec);
+            close(device[i]);
+        }
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        printf("Droped all devices - %ld.%09ld\n", ts.tv_sec, ts.tv_nsec);
+    }
 
     return 0;
 }
